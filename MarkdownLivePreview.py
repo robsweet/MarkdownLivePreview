@@ -6,238 +6,26 @@ preview_view: the preview view, in the special window
 original_window: the regular window
 preview_window: the window with the markdown file and the preview
 """
-
-import time
 import os.path
-import struct
+import time
+from functools import partial
+
 import sublime
 import sublime_plugin
 
-from functools import partial
-
 from .markdown2html import markdown2html
 
-MARKDOWN_VIEW_INFOS = "markdown_view_infos"
-PREVIEW_VIEW_INFOS = "preview_view_infos"
-SETTING_DELAY_BETWEEN_UPDATES = "delay_between_updates"
-
+PREVIEW_VIEW_INFO = "preview_view_info"
 resources = {}
 
 
-def plugin_loaded():
-    global DELAY
-    resources["base64_404_image"] = parse_image_resource(get_resource("404.base64"))
-    resources["base64_loading_image"] = parse_image_resource(
-        get_resource("loading.base64")
-    )
-    resources["stylesheet"] = get_resource("stylesheet.css")
-    # FIXME: how could we make this setting update without restarting sublime text
-    #        and not loading it every update as well
-    DELAY = get_settings().get(SETTING_DELAY_BETWEEN_UPDATES)
-
-
-class MdlpInsertCommand(sublime_plugin.TextCommand):
-    def run(self, edit, point, string):
-        self.view.insert(edit, point, string)
-
-
-class OpenMarkdownPreviewCommand(sublime_plugin.TextCommand):
-    def run(self, edit):
-
-        """ If the file is saved exists on disk, we close it, and reopen it in a new
-        window. Otherwise, we copy the content, erase it all (to close the file without
-        a dialog) and re-insert it into a new view into a new window """
-
-        original_view = self.view
-        original_window_id = original_view.window().id()
-        file_name = original_view.file_name()
-
-        syntax_file = original_view.settings().get("syntax")
-
-        if file_name:
-            original_view.close()
-        else:
-            # the file isn't saved, we need to restore the content manually
-            total_region = sublime.Region(0, original_view.size())
-            content = original_view.substr(total_region)
-            original_view.erase(edit, total_region)
-            original_view.close()
-            # FIXME: save the document to a temporary file, so that if we crash,
-            #        the user doesn't lose what he wrote
-
-        sublime.run_command("new_window")
-        preview_window = sublime.active_window()
-
-        preview_window.run_command(
-            "set_layout",
-            {
-                "cols": [0.0, 0.5, 1.0],
-                "rows": [0.0, 1.0],
-                "cells": [[0, 0, 1, 1], [1, 0, 2, 1]],
-            },
-        )
-
-        preview_window.focus_group(1)
-        preview_view = preview_window.new_file()
-        preview_view.set_scratch(True)
-        preview_view.settings().set(PREVIEW_VIEW_INFOS, {})
-        preview_view.set_name("Preview")
-        # FIXME: hide number lines on preview
-
-        preview_window.focus_group(0)
-        if file_name:
-            markdown_view = preview_window.open_file(file_name)
-        else:
-            markdown_view = preview_window.new_file()
-            markdown_view.run_command("mdlp_insert", {"point": 0, "string": content})
-            markdown_view.set_scratch(True)
-
-        markdown_view.set_syntax_file(syntax_file)
-        markdown_view.settings().set(
-            MARKDOWN_VIEW_INFOS, {"original_window_id": original_window_id,},
-        )
-
-    def is_enabled(self):
-        # FIXME: is this the best way there is to check if the current syntax is markdown?
-        #        should we only support default markdown?
-        #        what about "md"?
-        # FIXME: what about other languages, where markdown preview roughly works?
-        return "markdown" in self.view.settings().get("syntax").lower()
-
-
-class MarkdownLivePreviewListener(sublime_plugin.EventListener):
-
-    phantom_sets = {
-        # markdown_view.id(): phantom set
-    }
-
-    # we schedule an update for every key stroke, with a delay of DELAY
-    # then, we update only if now() - last_update > DELAY
-    last_update = 0
-
-    # FIXME: maybe we shouldn't restore the file in the original window...
-
-    def on_pre_close(self, markdown_view):
-        """ Close the view in the preview window, and store information for the on_close
-        listener (see doc there)
-        """
-        if not markdown_view.settings().get(MARKDOWN_VIEW_INFOS):
-            return
-
-        self.markdown_view = markdown_view
-        self.preview_window = markdown_view.window()
-        self.file_name = markdown_view.file_name()
-
-        if self.file_name is None:
-            total_region = sublime.Region(0, markdown_view.size())
-            self.content = markdown_view.substr(total_region)
-            markdown_view.erase(edit, total_region)
-        else:
-            self.content = None
-
-    def on_load_async(self, markdown_view):
-        infos = markdown_view.settings().get(MARKDOWN_VIEW_INFOS)
-        if not infos:
-            return
-
-        preview_view = markdown_view.window().active_view_in_group(1)
-
-        self.phantom_sets[markdown_view.id()] = sublime.PhantomSet(preview_view)
-        self._update_preview(markdown_view)
-
-    def on_close(self, markdown_view):
-        """ Use the information saved to restore the markdown_view as an original_view
-        """
-        infos = markdown_view.settings().get(MARKDOWN_VIEW_INFOS)
-        if not infos:
-            return
-
-        assert (
-            markdown_view.id() == self.markdown_view.id()
-        ), "pre_close view.id() != close view.id()"
-
-        del self.phantom_sets[markdown_view.id()]
-
-        self.preview_window.run_command("close_window")
-
-        # find the window with the right id
-        original_window = next(
-            window
-            for window in sublime.windows()
-            if window.id() == infos["original_window_id"]
-        )
-        if self.file_name:
-            original_window.open_file(self.file_name)
-        else:
-            assert markdown_view.is_scratch(), (
-                "markdown view of an unsaved file should " "be a scratch"
-            )
-            # note here that this is called original_view, because it's what semantically
-            # makes sense, but this original_view.id() will be different than the one
-            # that we closed first to reopen in the preview window
-            # shouldn't cause any trouble though
-            original_view = original_window.new_file()
-            original_view.run_command(
-                "mdlp_insert", {"point": 0, "string": self.content}
-            )
-
-            original_view.set_syntax_file(markdown_view.settings().get("syntax"))
-
-    # here, views are NOT treated independently, which is theoretically wrong
-    # but in practice, you can only edit one markdown file at a time, so it doesn't really
-    # matter.
-    # @min_time_between_call(.5)
-    def on_modified_async(self, markdown_view):
-
-        infos = markdown_view.settings().get(MARKDOWN_VIEW_INFOS)
-        if not infos:
-            return
-
-        # we schedule an update, which won't run if an
-        sublime.set_timeout(partial(self._update_preview, markdown_view), DELAY)
-
-    def _update_preview(self, markdown_view):
-        # if the buffer id is 0, that means that the markdown_view has been closed
-        # This check is needed since a this function is used as a callback for when images
-        # are loaded from the internet (ie. it could finish loading *after* the user
-        # closes the markdown_view)
-        if time.time() - self.last_update < DELAY / 1000:
-            return
-
-        if markdown_view.buffer_id() == 0:
-            return
-
-        self.last_update = time.time()
-
-        total_region = sublime.Region(0, markdown_view.size())
-        markdown = markdown_view.substr(total_region)
-
-        preview_view = markdown_view.window().active_view_in_group(1)
-        viewport_width = preview_view.viewport_extent()[0]
-
-        basepath = os.path.dirname(markdown_view.file_name())
-        html = markdown2html(
-            markdown,
-            basepath,
-            partial(self._update_preview, markdown_view),
-            resources,
-            viewport_width,
-        )
-
-        self.phantom_sets[markdown_view.id()].update(
-            [
-                sublime.Phantom(
-                    sublime.Region(0),
-                    html,
-                    sublime.LAYOUT_BLOCK,
-                    lambda href: sublime.run_command("open_url", {"url": href}),
-                )
-            ]
-        )
-
-
-def get_settings():
-    return sublime.load_settings("MarkdownLivePreview.sublime-settings")
+def find_preview(view):
+    """find previews for input view."""
+    view_id = view.id()
+    for x in view.window().views():
+        d = x.settings().get(PREVIEW_VIEW_INFO)
+        if d and d.get("id") == view_id:
+            yield x
 
 
 def get_resource(resource):
@@ -249,13 +37,85 @@ def get_resource(resource):
     return sublime.load_resource(path)
 
 
+class MarkdownLivePreviewListener(sublime_plugin.EventListener):
+    last_update = 0  # update only if now() - last_update > DELAY
+    phantom_sets = {}  # {preview.id(): PhantomSet}
+
+    def on_pre_close(self, view):
+        """Closing markdown files closes any associated previews."""
+        if "markdown" in view.settings().get("syntax").lower():
+            previews = list(find_preview(view))
+            if previews:
+                window = view.window()
+                for preview in previews:
+                    window.focus_view(preview)
+                    window.run_command("close_file")
+        else:
+            d = view.settings().get(PREVIEW_VIEW_INFO)
+            if d:
+                view_id = view.id()
+                if view_id in self.phantom_sets:
+                    del self.phantom_sets[view_id]
+
+    def on_modified_async(self, view):
+        """Schedule an update when changing markdown files"""
+        if "markdown" in view.settings().get("syntax").lower():
+            sublime.set_timeout(partial(self.update_preview, view), DELAY)
+
+    def update_preview(self, view):
+        # if the buffer id is 0, that means that the markdown_view has been
+        # closed. This check is needed since a this function is used as a
+        # callback for when images are loaded from the internet (ie. it could
+        # finish loading *after* the user closes the markdown_view)
+        if time.time() - self.last_update < DELAY / 1000:
+            return
+        if view.buffer_id() == 0:
+            return
+        previews = list(find_preview(view))
+        if not previews:
+            return
+        self.last_update = time.time()
+        for preview in previews:
+            html = markdown2html(
+                view.substr(sublime.Region(0, view.size())),
+                os.path.dirname(view.file_name()),
+                partial(self.update_preview, view),
+                resources,
+                preview.viewport_extent()[0],
+            )
+            self.phantom_sets[preview.id()].update(
+                [sublime.Phantom(sublime.Region(0), html, sublime.LAYOUT_BLOCK, lambda x: sublime.run_command("open_url", {"url": x}))]
+            )
+
+
+class OpenMarkdownPreviewCommand(sublime_plugin.TextCommand):
+    def run(self, edit):
+        """Set to multi-pane layout. Open markdown preview in another pane."""
+        window = sublime.active_window()
+        if window.num_groups() < 2:
+            window.set_layout({"cols": [0.0, 0.5, 1.0], "rows": [0.0, 1.0], "cells": [[0, 0, 1, 1], [1, 0, 2, 1]]})
+        window.focus_group(0 if window.active_group() else 1)
+        view = window.new_file()
+        view.set_scratch(True)
+        view.set_name("Preview")
+        view.settings().set(PREVIEW_VIEW_INFO, {"id": self.view.id()})
+        ps = MarkdownLivePreviewListener.phantom_sets
+        ps[view.id()] = sublime.PhantomSet(view)
+        MarkdownLivePreviewListener().update_preview(self.view)
+        window.focus_view(self.view)
+
+    def is_enabled(self):
+        return "markdown" in self.view.settings().get("syntax").lower()
+
+
 def parse_image_resource(text):
     width, height, base64_image = text.splitlines()
     return base64_image, (int(width), int(height))
 
 
-# try to reload the resources if we save this file
-try:
-    plugin_loaded()
-except OSError:
-    pass
+def plugin_loaded():
+    global DELAY
+    DELAY = sublime.load_settings("MarkdownLivePreview.sublime-settings").get("delay_between_updates")
+    resources["base64_404_image"] = parse_image_resource(get_resource("404.base64"))
+    resources["base64_loading_image"] = parse_image_resource(get_resource("loading.base64"))
+    resources["stylesheet"] = get_resource("stylesheet.css")

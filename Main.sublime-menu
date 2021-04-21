@@ -1,0 +1,21 @@
+[
+  {
+    "id": "preferences",
+    "children": [
+      {
+        "caption": "Package Settings",
+        "id": "package-settings",
+        "children": [
+          {
+            "caption": "MarkdownLivePreview settings",
+            "command": "edit_settings",
+            "args": {
+              "base_file": "${packages}/MarkdownLivePreview/MarkdownLivePreview.sublime-settings",
+              "default": "{\n\t$0\n}\n"
+            }
+          }
+        ]
+      }
+    ]
+  }
+]
